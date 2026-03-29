@@ -2268,26 +2268,29 @@ async function modalConfirm() {
    SHARE LINK (URL hash encoding)
    — الرابط يفتح صفحة viewer.html منفصلة
    — لا يُحوَّل المستخدم إلى الحاسبة نهائياً
+   — يستخدم ضغط zlib لتقليل حجم الرابط ~30%
 ───────────────────────────────────── */
 
-/* دالة تقصير الرابط عبر TinyURL — مع احتياطي للرابط الأصلي */
-async function shortenUrl(longUrl) {
+/* ضغط النص باستخدام DecompressionStream (متاح Chrome80+, Firefox113+, Safari16+) */
+async function compressToBase64(str) {
   try {
-    const res = await fetch(
-      'https://tinyurl.com/api-create.php?url=' + encodeURIComponent(longUrl),
-      { signal: AbortSignal.timeout(6000) }   // مهلة 6 ثوانٍ
-    );
-    if (!res.ok) throw new Error('TinyURL HTTP ' + res.status);
-    const short = (await res.text()).trim();
-    // تحقق أن الرد رابط حقيقي وليس رسالة خطأ
-    if (short.startsWith('https://tinyurl.com/') || short.startsWith('http://tinyurl.com/')) {
-      return short;
-    }
-    throw new Error('unexpected response: ' + short);
-  } catch (err) {
-    console.warn('shortenUrl failed, using long URL:', err);
-    return longUrl;   // حل احتياطي: الرابط الأصلي
+    const bytes  = new TextEncoder().encode(str);
+    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+    const buf    = await new Response(stream).arrayBuffer();
+    const arr    = new Uint8Array(buf);
+    let bin = '';
+    arr.forEach(b => bin += String.fromCharCode(b));
+    return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  } catch(e) {
+    // احتياطي: تشفير عادي بدون ضغط إذا لم يدعمه المتصفح
+    return null;
   }
+}
+
+/* تشفير بدون ضغط (احتياطي للمتصفحات القديمة) */
+function encodeB64(str) {
+  return btoa(unescape(encodeURIComponent(str)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 }
 
 async function buildShareLink(chosenPlans) {
@@ -2309,35 +2312,33 @@ async function buildShareLink(chosenPlans) {
   };
 
   const json    = JSON.stringify(payload);
-  const encoded = btoa(unescape(encodeURIComponent(json)))
-    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-
-  // بناء رابط viewer.html منفصل — لا علاقة له بالحاسبة
   const baseUrl = window.location.href.split('/').slice(0,-1).join('/') + '/viewer.html';
-  const longUrl = baseUrl + '#s=' + encoded;
 
   const linkBox   = document.getElementById('shareLinkBox');
   const copyBtn   = document.getElementById('shareLinkCopyBtn');
   const container = document.getElementById('shareLinkContainer');
 
-  // عرض حالة الانتظار
-  linkBox.textContent = '⏳ جاري تقصير الرابط...';
+  // عرض حالة المعالجة
+  linkBox.textContent = '⏳ جاري إنشاء الرابط...';
   container.style.display = 'block';
   copyBtn.disabled = true;
 
-  // تقصير الرابط (أو الاحتفاظ بالأصلي عند الفشل)
-  const url = await shortenUrl(longUrl);
+  // محاولة الضغط أولاً، ثم الاحتياطي
+  let url;
+  const compressed = await compressToBase64(json);
+  if (compressed) {
+    url = baseUrl + '#z=' + compressed;   // z = مضغوط
+  } else {
+    url = baseUrl + '#s=' + encodeB64(json);  // s = عادي (احتياطي)
+  }
 
   linkBox.textContent = url;
   copyBtn.disabled = false;
 
-  // دالة مشتركة للنسخ
-  function doCopy(textToCopy) {
+  function doCopy(text) {
     const ta = document.createElement('textarea');
-    ta.value = textToCopy;
-    ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
+    ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
     try { document.execCommand('copy'); } catch(e) {}
     document.body.removeChild(ta);
   }
@@ -2350,7 +2351,7 @@ async function buildShareLink(chosenPlans) {
       this.textContent = '📋 نسخ الرابط';
       this.classList.remove('copied');
     }, 2500);
-    showToast('✅ تم نسخ الرابط' + (url === longUrl ? '' : ' القصير'));
+    showToast('✅ تم نسخ الرابط');
   };
 
   // زر مشاركة واتساب
@@ -2368,15 +2369,23 @@ async function buildShareLink(chosenPlans) {
    — عند فتح رابط المشاركة يُعرَض PDF مباشرة
    — لا يُحوَّل المستخدم إلى الحاسبة
 ───────────────────────────────────── */
+/* فك ضغط raw-deflate من base64 — لقراءة روابط #z= */
+async function decompressFromBase64(b64) {
+  const bin    = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
+  const buf    = Uint8Array.from(bin, c => c.charCodeAt(0));
+  const stream = new Blob([buf]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return await new Response(stream).text();
+}
+
 function loadSharedView() {
-  const hash  = window.location.hash;
-  const isV3  = hash.startsWith('#s=');
-  const isOld = hash.startsWith('#share=');
-  if (!isV3 && !isOld) return false;
-  try {
-    const rawEnc  = isV3 ? hash.slice(3) : hash.slice(7);
-    const encoded = rawEnc.replace(/-/g,'+').replace(/_/g,'/') + '=='.slice(0,(4-rawEnc.length%4)%4);
-    const payload = JSON.parse(decodeURIComponent(escape(atob(encoded))));
+  const hash   = window.location.hash;
+  const isComp = hash.startsWith('#z=');      // رابط مضغوط جديد
+  const isV3   = hash.startsWith('#s=');      // رابط عادي v3
+  const isOld  = hash.startsWith('#share=');  // رابط قديم
+  if (!isComp && !isV3 && !isOld) return false;
+
+  /* معالجة الـ payload بعد فك التشفير */
+  function processPayload(payload) {
     if (!payload) return false;
 
     let u_nm,u_g,u_ay,u_am,u_ts,u_py,u_pm,u_sa, plans;
@@ -2467,6 +2476,28 @@ function loadSharedView() {
     buildNavBar();
     setTimeout(()=>exportPDFPlans(plans),800);
     return true;
+  }
+
+  /* إذا كان الرابط مضغوطاً — نفك الضغط أولاً ثم نعالج */
+  if (isComp) {
+    const rawEnc = hash.slice(3);
+    decompressFromBase64(rawEnc)
+      .then(jsonStr => {
+        try {
+          const payload = JSON.parse(jsonStr);
+          processPayload(payload);
+        } catch(e) { console.warn('Decompress parse error:', e); }
+      })
+      .catch(e => { console.warn('Decompress error:', e); });
+    return true;  // نُعيد true فوراً (المعالجة ستتم بشكل غير متزامن)
+  }
+
+  /* روابط قديمة غير مضغوطة */
+  try {
+    const rawEnc  = isV3 ? hash.slice(3) : hash.slice(7);
+    const encoded = rawEnc.replace(/-/g,'+').replace(/_/g,'/') + '=='.slice(0,(4-rawEnc.length%4)%4);
+    const payload = JSON.parse(decodeURIComponent(escape(atob(encoded))));
+    return processPayload(payload);
   } catch(e){ console.warn('Share link parse error:',e); return false; }
 }
 

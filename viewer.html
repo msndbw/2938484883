@@ -3,12 +3,6 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<!-- منع التضمين في iframe من مواقع أخرى -->
-<meta http-equiv="X-Frame-Options" content="SAMEORIGIN">
-<!-- منع تخمين نوع المحتوى -->
-<meta http-equiv="X-Content-Type-Options" content="nosniff">
-<!-- منع التخزين المؤقت للبيانات الحساسة -->
-<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
 <title>عرض جدول التقاعد</title>
 <link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Tajawal:wght@300;400;500;700;900&display=swap" rel="stylesheet">
 <style>
@@ -506,49 +500,26 @@ main { max-width: 900px; margin: 0 auto; padding: 24px 18px 80px; }
   }
 
   /* ── فك تشفير الرابط ─────────────────────── */
-  function decodePayload() {
+  /* فك ضغط raw-deflate — لروابط #z= */
+  async function decompressFromBase64(b64) {
+    const bin    = atob(b64.replace(/-/g,'+').replace(/_/g,'/'));
+    const buf    = Uint8Array.from(bin, c => c.charCodeAt(0));
+    const stream = new Blob([buf]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+    return await new Response(stream).text();
+  }
+
+  /* فك تشفير روابط #s= و #share= القديمة */
+  function decodePayloadSync() {
     const hash = window.location.hash;
     const isV3  = hash.startsWith('#s=');
     const isOld = hash.startsWith('#share=');
     if (!isV3 && !isOld) return null;
-
-    const rawEnc = isV3 ? hash.slice(3) : hash.slice(7);
-
-    // رفض البيانات الفارغة أو القصيرة جداً
-    if (!rawEnc || rawEnc.length < 10) return null;
-
-    // رفض أي محارف غير متوقعة (Base64-URL safe فقط)
-    if (!/^[A-Za-z0-9\-_]+$/.test(rawEnc)) return null;
-
+    const rawEnc  = isV3 ? hash.slice(3) : hash.slice(7);
     const encoded = rawEnc.replace(/-/g,'+').replace(/_/g,'/')
                           + '=='.slice(0,(4 - rawEnc.length % 4) % 4);
-    const payload = JSON.parse(decodeURIComponent(escape(atob(encoded))));
-    return payload;
+    return JSON.parse(decodeURIComponent(escape(atob(encoded))));
   }
 
-  /* ── التحقق من سلامة الـ payload ────────── */
-  function validatePayload(payload) {
-    if (!payload || typeof payload !== 'object') return false;
-    if (payload.v === 3) {
-      if (!Array.isArray(payload.u) || payload.u.length < 8) return false;
-      if (!Array.isArray(payload.p) || payload.p.length === 0) return false;
-      const [nm, g, ay, am, ts] = payload.u;
-      if (typeof nm !== 'string') return false;
-      if (g !== 0 && g !== 1) return false;
-      if (ay < 18 || ay > 80) return false;   // عمر معقول
-      if (am < 0  || am > 11) return false;   // أشهر 0-11
-      if (ts < 0  || ts > 600) return false;  // خدمة بالأشهر (50 سنة max)
-      for (const p of payload.p) {
-        if (!Array.isArray(p) || p.length < 7) return false;
-      }
-      return true;
-    }
-    // إصدارات قديمة: قبول مرن
-    if (payload.v === 2 || payload.v === 1 || !payload.v) {
-      return !!(payload.u && (payload.plans || payload.p));
-    }
-    return false;
-  }
 
   /* ── بناء بيانات الخطط من الـ payload ─────── */
   function parsePlans(payload) {
@@ -954,61 +925,61 @@ main { max-width: 900px; margin: 0 auto; padding: 24px 18px 80px; }
       if (msg) errMsg.innerHTML = msg;
     }
 
-    // فحص وجود hash
-    if (!window.location.hash ||
-        (!window.location.hash.startsWith('#s=') &&
-         !window.location.hash.startsWith('#share='))) {
+    // فحص وجود hash صالح (#z= مضغوط / #s= عادي / #share= قديم)
+    const hash = window.location.hash;
+    const isComp = hash.startsWith('#z=');
+    const isV3   = hash.startsWith('#s=');
+    const isOld  = hash.startsWith('#share=');
+
+    if (!hash || (!isComp && !isV3 && !isOld)) {
       showError('لا يوجد رابط خطة في هذا العنوان.<br>يرجى التواصل مع من أرسل لك الرابط.');
       return;
     }
 
-    try {
-      const payload = decodePayload();
-      if (!payload) { showError('الرابط غير صحيح أو يحتوي على بيانات غير صالحة.'); return; }
-
-      // التحقق من سلامة البيانات قبل معالجتها
-      if (!validatePayload(payload)) {
-        showError('بيانات الجدول غير مكتملة أو خارج النطاق المسموح به.');
-        return;
-      }
-
+    /* دالة مشتركة لعرض الخطط بعد فك التشفير */
+    function renderPayload(payload) {
+      if (!payload) { showError(); return; }
       const result = parsePlans(payload);
       if (!result || !result.plans.length) { showError(); return; }
 
       PLANS = result.plans;
       USER  = result.user;
 
-      // مسح الـ hash من شريط العنوان بعد القراءة (لا يُظهر البيانات للمستخدم)
-      if (window.history && window.history.replaceState) {
-        window.history.replaceState(null, '', window.location.pathname);
-      }
-
-      // إخفاء حالة التحميل
       loading.style.display = 'none';
 
-      // تحديث شريط المعلومات
       const gender = USER.gender === 'male' ? 'ذكر' : 'أنثى';
       infoLabel.innerHTML = `🔗 جدول مشارَك لـ <b>${USER.nm || 'مشترك'}</b> · ${gender} · ${USER.ay} سنة`;
       actionBar.style.display = 'flex';
 
-      // بناء المحتوى
       let html = buildSummaryHTML(USER);
       PLANS.forEach((p, i) => { html += buildCardHTML(p, i, USER); });
       content.innerHTML = html;
 
-      // أزرار PDF
       document.getElementById('openPdfBtn').onclick = exportPDF;
       document.getElementById('dlPdfBtn').onclick   = function() {
         exportPDF();
         showToast('✅ استخدم "حفظ كـ PDF" في حوار الطباعة');
       };
 
-      // تشغيل PDF تلقائياً بعد ثانية (كما في الحاسبة الأصلية)
       setTimeout(exportPDF, 900);
+    }
 
-    } catch (e) {
-      console.warn('Viewer parse error:', e);
-      showError('تعذّر قراءة بيانات الجدول.<br>الرابط قد يكون تالفاً أو منتهي الصلاحية.');
+    if (isComp) {
+      // رابط مضغوط #z= — فك الضغط أولاً
+      decompressFromBase64(hash.slice(3))
+        .then(jsonStr => {
+          try { renderPayload(JSON.parse(jsonStr)); }
+          catch(e) { showError('تعذّر قراءة بيانات الجدول المضغوط.'); }
+        })
+        .catch(() => showError('تعذّر فك ضغط الرابط. تأكد من تحديث متصفحك.'));
+    } else {
+      // روابط قديمة #s= / #share=
+      try {
+        renderPayload(decodePayloadSync());
+      } catch (e) {
+        console.warn('Viewer parse error:', e);
+        showError('تعذّر قراءة بيانات الجدول.<br>الرابط قد يكون تالفاً أو منتهي الصلاحية.');
+      }
     }
   });
 
